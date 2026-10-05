@@ -1,0 +1,14 @@
+# Visual Pinball X standalone, extracted by setup_vpinball_bazzite.sh
+/vpx/
+
+# VPinFE bundle, extracted by setup_vpinball_bazzite.sh. Everything inside is
+# ignored except the files this setup modifies (see CLAUDE.md).
+/vpinfe/**
+!/vpinfe/**/
+!/vpinfe/_internal/chromium/linux/chrome/chrome
+!/vpinfe/_internal/web/diag/gamepad.html
+
+# User content: tables, ROMs and PinUP videos
+/tables/
+/roms/
+/pupvideos/
