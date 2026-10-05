@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installed by run_vpinfe_gamepad.sh: drop PyInstaller's LD_LIBRARY_PATH.
+# Installed by vpinfe_fixes.sh: drop PyInstaller's LD_LIBRARY_PATH.
 if [[ -n "${LD_LIBRARY_PATH_ORIG:-}" ]]; then
     export LD_LIBRARY_PATH="$LD_LIBRARY_PATH_ORIG"
 else

@@ -254,22 +254,48 @@ else
 fi
 
 # ------------------------------------------------------------
-# Chromium wrapper
+# Shared VPinFE workarounds (vpinfe_fixes.sh)
 #
-# VPinFE is a PyInstaller bundle: any Chromium it spawns itself inherits
-# LD_LIBRARY_PATH=_internal and loads the bundled Ubuntu libs instead of the
-# system ones. Input is dead and Chromium aborts in NSS init after ~17 s
-# (exit -6; _internal has no libsoftokn3/libfreebl3). Replace the binary with
-# a wrapper that restores the original environment. run_vpinfe_gamepad.sh
-# re-applies this automatically after a VPinFE upgrade.
+# Sourced by both launchers. Installs the Chromium wrapper: VPinFE is a
+# PyInstaller bundle and any Chromium it spawns inherits
+# LD_LIBRARY_PATH=_internal, which kills input and makes Chromium abort in
+# NSS init after ~17 s (exit -6). Also installs the patched gamepad page.
 # ------------------------------------------------------------
 
-if [[ -f "$CHROME_BIN" && ! -e "$CHROME_BIN.bin" ]]; then
-    log "Installing Chromium environment wrapper"
+log "Creating shared VPinFE workarounds"
+
+cat > "$VPINBALL_ROOT/vpinfe_fixes.sh" <<'FIXES_EOF'
+# Shared VPinFE workarounds, sourced by run_vpinfe.sh and run_vpinfe_gamepad.sh.
+# Both are idempotent and re-apply themselves after a VPinFE upgrade.
+
+ROOT="${ROOT:-$HOME/vpinball}"
+VPINFE_DIR="$ROOT/vpinfe"
+VPINFE_BIN="$VPINFE_DIR/vpinfe"
+CHROME_BIN="$VPINFE_DIR/_internal/chromium/linux/chrome/chrome"
+GAMEPAD_PAGE="$VPINFE_DIR/_internal/web/diag/gamepad.html"
+GAMEPAD_PATCH="$ROOT/vpinfe-patches/gamepad.html"
+
+# VPinFE is a PyInstaller bundle: the Chromium it spawns inherits
+# LD_LIBRARY_PATH=_internal and loads the bundled Ubuntu libs instead of the
+# system ones. Input is dead and Chromium aborts in NSS init (no
+# libsoftokn3/libfreebl3 in _internal). Swap in a wrapper that restores the
+# original environment.
+install_chrome_wrapper() {
+    if [[ -e "$CHROME_BIN.bin" ]]; then
+        return
+    fi
+    if [[ ! -f "$CHROME_BIN" ]]; then
+        echo "Bundled Chromium not found at $CHROME_BIN (slim VPinFE build?)." >&2
+        return
+    fi
+    if [[ "$(head -c 4 "$CHROME_BIN" | tr -d '\0')" != $'\x7fELF' ]]; then
+        echo "Unexpected Chromium binary at $CHROME_BIN, not wrapping." >&2
+        return
+    fi
     mv "$CHROME_BIN" "$CHROME_BIN.bin"
-    cat > "$CHROME_BIN" <<'WRAPPER_EOF'
+    cat > "$CHROME_BIN" <<'EOF'
 #!/usr/bin/env bash
-# Installed by run_vpinfe_gamepad.sh: drop PyInstaller's LD_LIBRARY_PATH.
+# Installed by vpinfe_fixes.sh: drop PyInstaller's LD_LIBRARY_PATH.
 if [[ -n "${LD_LIBRARY_PATH_ORIG:-}" ]]; then
     export LD_LIBRARY_PATH="$LD_LIBRARY_PATH_ORIG"
 else
@@ -277,9 +303,43 @@ else
 fi
 unset LD_LIBRARY_PATH_ORIG
 exec "$(dirname "$(readlink -f "$0")")/chrome.bin" --ozone-platform=x11 "$@"
-WRAPPER_EOF
+EOF
     chmod +x "$CHROME_BIN"
-fi
+}
+
+# Upstream gamepad.html only reads navigator.getGamepads()[0]. With Steam
+# running, slot 0 can be Steam's idle virtual "X-Box 360 pad", so presses on
+# the real controller are ignored. Swap in the patched page, keeping the
+# original as .orig.
+patch_gamepad_page() {
+    if [[ ! -f "$GAMEPAD_PATCH" ]]; then
+        echo "No patched gamepad page at $GAMEPAD_PATCH, using the stock one." >&2
+        return
+    fi
+    if [[ -e "$GAMEPAD_PAGE.orig" ]]; then
+        cmp -s "$GAMEPAD_PATCH" "$GAMEPAD_PAGE" || cp "$GAMEPAD_PATCH" "$GAMEPAD_PAGE"
+        return
+    fi
+    if ! grep -q 'const gp = gamepads\[0\];' "$GAMEPAD_PAGE"; then
+        echo "Upstream gamepad.html changed, not patching it." >&2
+        return
+    fi
+    cp "$GAMEPAD_PAGE" "$GAMEPAD_PAGE.orig"
+    cp "$GAMEPAD_PATCH" "$GAMEPAD_PAGE"
+}
+
+# Avoid stale copies occupying ports 8000-8002.
+stop_stale_vpinfe() {
+    pkill -f "$VPINFE_BIN" 2>/dev/null || true
+    pkill -f "$CHROME_BIN" 2>/dev/null || true
+    sleep 1
+}
+FIXES_EOF
+
+log "Installing Chromium environment wrapper"
+# shellcheck source=/dev/null
+ROOT="$VPINBALL_ROOT" source "$VPINBALL_ROOT/vpinfe_fixes.sh"
+install_chrome_wrapper
 
 # ------------------------------------------------------------
 # Patched gamepad page
@@ -397,102 +457,32 @@ EOF
 chmod +x "$VPINBALL_ROOT/run_vpx.sh"
 
 # ------------------------------------------------------------
-# VPinFE stable Bazzite launcher
+# VPinFE launcher
 #
-# VPinFE runs --headless and Chromium is launched from bash, so it gets a
-# clean environment (no PyInstaller LD_LIBRARY_PATH, see the wrapper above)
-# and is forced through XWayland.
+# VPinFE manages Chromium itself (bridge ordering, vpinfe.ini display
+# settings, working Exit); the wrapper above makes that work on Bazzite.
 # ------------------------------------------------------------
 
 log "Creating VPinFE launcher"
 
-cat > "$VPINBALL_ROOT/run_vpinfe.sh" <<'EOF'
+cat > "$VPINBALL_ROOT/run_vpinfe.sh" <<'LAUNCHER_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 ROOT="$HOME/vpinball"
-VPINFE_DIR="$ROOT/vpinfe"
-VPINFE_BIN="$VPINFE_DIR/vpinfe"
-CHROME_BIN="$VPINFE_DIR/_internal/chromium/linux/chrome/chrome"
+source "$ROOT/vpinfe_fixes.sh"
 
-cleanup() {
-    if [[ -n "${CHROME_PID:-}" ]] && kill -0 "$CHROME_PID" 2>/dev/null; then
-        kill "$CHROME_PID" 2>/dev/null || true
-        wait "$CHROME_PID" 2>/dev/null || true
-    fi
-
-    if [[ -n "${VPINFE_PID:-}" ]] && kill -0 "$VPINFE_PID" 2>/dev/null; then
-        kill "$VPINFE_PID" 2>/dev/null || true
-        wait "$VPINFE_PID" 2>/dev/null || true
-    fi
-}
-
-trap cleanup EXIT INT TERM
-
-# Avoid stale copies occupying ports 8000-8002.
-pkill -f "$VPINFE_BIN" 2>/dev/null || true
-pkill -f "$CHROME_BIN" 2>/dev/null || true
-sleep 1
+stop_stale_vpinfe
+install_chrome_wrapper
 
 cd "$VPINFE_DIR"
-"$VPINFE_BIN" --headless &
-VPINFE_PID=$!
 
-# Wait until VPinFE's asset server is ready.
-for _ in {1..50}; do
-    if (echo > /dev/tcp/127.0.0.1/8000) >/dev/null 2>&1; then
-        break
-    fi
-    if ! kill -0 "$VPINFE_PID" 2>/dev/null; then
-        echo "VPinFE stopped before port 8000 became ready." >&2
-        exit 1
-    fi
-    sleep 0.2
-done
-
-if [[ ! -x "$CHROME_BIN" ]]; then
-    echo "Bundled Chromium not found at:" >&2
-    echo "  $CHROME_BIN" >&2
-    echo "Install the non-slim VPinFE linux-x64 package." >&2
-    exit 1
-fi
-
-"$CHROME_BIN" \
-    --app='http://127.0.0.1:8000/app/table' \
-    --window-name=vpinfe-table \
-    --class=vpinfe-table \
-    --window-position=0,0 \
-    --window-size=1920,1080 \
-    --user-data-dir=/tmp/vpinfe-manual \
-    --kiosk \
-    --start-maximized \
-    --no-first-run \
-    --noerrdialogs \
-    --disable-infobars \
-    --disable-session-crashed-bubble \
-    --disable-restore-session-state \
-    --disable-background-networking \
-    --disable-component-update \
-    --disable-default-apps \
-    --disable-background-timer-throttling \
-    --disable-backgrounding-occluded-windows \
-    --disable-renderer-backgrounding \
-    --disable-background-media-suspend \
-    --disable-features=CalculateNativeWindowOcclusion,PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies \
-    --disable-hang-monitor \
-    --disable-ipc-flooding-protection \
-    --disable-gpu-process-crash-limit \
-    --ignore-gpu-blocklist \
-    --no-sandbox \
-    --disable-gpu-sandbox \
-    --autoplay-policy=no-user-gesture-required \
-    --test-type \
-    --ozone-platform=x11 &
-
-CHROME_PID=$!
-
-wait "$CHROME_PID"
-EOF
+# Let VPinFE manage Chromium itself: it starts the WebSocket bridge before
+# opening windows, applies the [Displays]/chromeoptions settings from
+# vpinfe.ini, and can close its own windows on Exit. The Chromium wrapper
+# (vpinfe_fixes.sh) is what makes VPinFE-launched Chromium work on Bazzite.
+exec "$VPINFE_BIN"
+LAUNCHER_EOF
 
 chmod +x "$VPINBALL_ROOT/run_vpinfe.sh"
 
@@ -507,66 +497,9 @@ cat > "$VPINBALL_ROOT/run_vpinfe_gamepad.sh" <<'LAUNCHER_EOF'
 set -Eeuo pipefail
 
 ROOT="$HOME/vpinball"
-VPINFE_DIR="$ROOT/vpinfe"
-VPINFE_BIN="$VPINFE_DIR/vpinfe"
-CHROME_BIN="$VPINFE_DIR/_internal/chromium/linux/chrome/chrome"
-GAMEPAD_PAGE="$VPINFE_DIR/_internal/web/diag/gamepad.html"
-GAMEPAD_PATCH="$ROOT/vpinfe-patches/gamepad.html"
+source "$ROOT/vpinfe_fixes.sh"
 
-# VPinFE is a PyInstaller bundle: the Chromium it spawns inherits
-# LD_LIBRARY_PATH=_internal and loads the bundled Ubuntu libs instead of the
-# system ones. Input is dead and Chromium aborts in NSS init (no
-# libsoftokn3/libfreebl3 in _internal). Swap in a wrapper that restores the
-# original environment. Re-applied automatically after a VPinFE upgrade.
-install_chrome_wrapper() {
-    if [[ -e "$CHROME_BIN.bin" ]]; then
-        return
-    fi
-    if [[ "$(head -c 4 "$CHROME_BIN" | tr -d '\0')" != $'\x7fELF' ]]; then
-        echo "Unexpected Chromium binary at $CHROME_BIN, not wrapping." >&2
-        return
-    fi
-    mv "$CHROME_BIN" "$CHROME_BIN.bin"
-    cat > "$CHROME_BIN" <<'EOF'
-#!/usr/bin/env bash
-# Installed by run_vpinfe_gamepad.sh: drop PyInstaller's LD_LIBRARY_PATH.
-if [[ -n "${LD_LIBRARY_PATH_ORIG:-}" ]]; then
-    export LD_LIBRARY_PATH="$LD_LIBRARY_PATH_ORIG"
-else
-    unset LD_LIBRARY_PATH
-fi
-unset LD_LIBRARY_PATH_ORIG
-exec "$(dirname "$(readlink -f "$0")")/chrome.bin" --ozone-platform=x11 "$@"
-EOF
-    chmod +x "$CHROME_BIN"
-}
-
-# Upstream gamepad.html only reads navigator.getGamepads()[0]. With Steam
-# running, slot 0 can be Steam's idle virtual "X-Box 360 pad", so presses on
-# the real controller are ignored. Swap in the patched page, keeping the
-# original as .orig. Re-applied automatically after a VPinFE upgrade.
-patch_gamepad_page() {
-    if [[ ! -f "$GAMEPAD_PATCH" ]]; then
-        echo "No patched gamepad page at $GAMEPAD_PATCH, using the stock one." >&2
-        return
-    fi
-    if [[ -e "$GAMEPAD_PAGE.orig" ]]; then
-        cmp -s "$GAMEPAD_PATCH" "$GAMEPAD_PAGE" || cp "$GAMEPAD_PATCH" "$GAMEPAD_PAGE"
-        return
-    fi
-    if ! grep -q 'const gp = gamepads\[0\];' "$GAMEPAD_PAGE"; then
-        echo "Upstream gamepad.html changed, not patching it." >&2
-        return
-    fi
-    cp "$GAMEPAD_PAGE" "$GAMEPAD_PAGE.orig"
-    cp "$GAMEPAD_PATCH" "$GAMEPAD_PAGE"
-}
-
-# Avoid stale copies occupying ports 8000-8002.
-pkill -f "$VPINFE_BIN" 2>/dev/null || true
-pkill -f "$CHROME_BIN" 2>/dev/null || true
-sleep 1
-
+stop_stale_vpinfe
 install_chrome_wrapper
 patch_gamepad_page
 
